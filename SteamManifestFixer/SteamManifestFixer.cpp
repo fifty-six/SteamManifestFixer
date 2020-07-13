@@ -6,6 +6,7 @@ uint32_t GetProcessIdByName(std::string processName)
 	entry.dwSize = sizeof(PROCESSENTRY32);
 
 	HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, NULL);
+
 	if (Process32First(snapshot, &entry))
 	{
 		while (Process32Next(snapshot, &entry))
@@ -24,30 +25,55 @@ HMODULE GetHandleForModule(HANDLE processHandle, std::string targetModule)
 {
 	HMODULE moduleHandles[1024];
 	DWORD cbNeeded;
-	if (EnumProcessModules(
+
+	if (EnumProcessModulesEx(
 		processHandle,
 		moduleHandles,
 		sizeof(moduleHandles),
-		&cbNeeded))
+		&cbNeeded,
+		0x03
+	))
 	{
-		for (HMODULE moduleHandle : moduleHandles)
+		if (cbNeeded > 1024 * sizeof(HMODULE))
 		{
-			TCHAR moduleName[MAX_PATH];
+			std::cout << "Missing module names, buffer too small." << std::endl;
+		}
+
+		for (size_t i = 0; i < (cbNeeded / sizeof(HMODULE)); i++)
+		{
+			HMODULE moduleHandle = moduleHandles[i];
+
+			TCHAR moduleName[MAX_PATH * 2];
+
 			if (GetModuleFileNameEx(
 				processHandle,
 				moduleHandle,
 				moduleName,
 				sizeof(moduleName) / sizeof(TCHAR)))
 			{
+				std::cout << "ModuleName: " << moduleName << std::endl;
+
 				if (std::string(moduleName).find(targetModule) != std::string::npos)
 				{
 					return moduleHandle;
 				}
 			}
+			else
+			{
+				std::cerr << "Unable to get a module name for handle: " << moduleHandle << std::endl;
+			}
 		}
 	}
+	else 
+	{
+		std::cout << "Unable to enumerate process modules." << std::endl;
 
-	return nullptr;
+		throw std::runtime_error("EnumProcessModulesEx failed.");
+	}
+
+	std::cout << "Unable to find moduleHandle for processHandle: " << processHandle << ", with target: " << targetModule << std::endl;
+
+	throw std::runtime_error("EnumProcessModules failed.");
 }
 
 uint32_t GetModuleSize(HANDLE processHandle, HMODULE moduleHandle)
@@ -65,16 +91,19 @@ uint32_t GetModuleSize(HANDLE processHandle, HMODULE moduleHandle)
 	return -1;
 }
 
-uint32_t GetPatchAddress(HANDLE processHandle, uint32_t address, uint32_t size)
+uintptr_t GetPatchAddress(HANDLE processHandle, uint32_t address, uint32_t size)
 {
-	uint8_t* buffer = (uint8_t*)malloc(size);
+	uint8_t* buffer = (uint8_t*) malloc(size);
+
 	SIZE_T bytesRead;
+	
 	if (ReadProcessMemory(
 		processHandle,
 		(LPCVOID)address,
 		buffer,
 		size,
-		&bytesRead))
+		&bytesRead
+	))
 	{
 		std::vector<uint8_t> egg = {
 			0x84, 0xC0, 
@@ -82,91 +111,123 @@ uint32_t GetPatchAddress(HANDLE processHandle, uint32_t address, uint32_t size)
 		};
 
 		std::vector<uint8_t> image(buffer, buffer + bytesRead);
+
 		free(buffer);
 
 		auto it = std::search(
-			image.begin(), image.end(),
-			egg.begin(), egg.end());
+			image.begin(),
+		       	image.end(),
+			egg.begin(),
+		       	egg.end()
+		);
+
 		if (it != image.end())
 		{
-			uint32_t offset = it - image.begin();
+			uintptr_t offset = it - image.begin();
+
 			return address + offset + 2;
 		}
+		else 
+		{
+			std::cerr << "Read process memory, but was unable to find egg." << std::endl;
+
+			throw std::runtime_error("Unable to find egg.");
+		}
 	}
-	return -1;
+
+	auto err = GetLastError();
+
+	std::cerr << "Unable to read process memory. Error: " << err << std::endl;
+
+	throw std::runtime_error("ReadProcessMemory failed.");
 }
 
-bool WritePatch(HANDLE processHandle, uint32_t imageBase, uint32_t imageSize, uint32_t patchAddress)
+bool WritePatch(HANDLE processHandle, uintptr_t imageBase, uint32_t imageSize, uint32_t patchAddress)
 {
 	DWORD oldProtection;
-	if (VirtualProtectEx(
+
+	if (!VirtualProtectEx(
 		processHandle,
 		(void*)imageBase,
 		imageSize,
 		PAGE_EXECUTE_READWRITE,
 		&oldProtection))
 	{
-		std::vector<uint8_t> patch = {
-			0x0F, 0x84, 0x2E, 0xFF, 0xFF, 0xFF
-		};
-
-		SIZE_T bytesWritten;
-		if (WriteProcessMemory(
-			processHandle,
-			(void*)patchAddress,
-			std::data(patch),
-			patch.size(),
-			&bytesWritten))
-		{
-			return true;
-		}
+		return false;
 	}
 
-	return false;
+	std::vector<uint8_t> patch = {
+		0x0F, 0x84, 0x2E, 0xFF, 0xFF, 0xFF
+	};
+
+	SIZE_T bytesWritten;
+
+	return WriteProcessMemory
+	(
+		processHandle,
+		(void*)patchAddress,
+		std::data(patch),
+		patch.size(),
+		&bytesWritten
+	);
 }
 
 int main()
 {
 	auto processId = GetProcessIdByName("steam.exe");
+
 	auto processHandle = OpenProcess(
 		PROCESS_ALL_ACCESS,
 		FALSE,
-		processId);
+		processId
+	);
+
 	auto moduleHandle = GetHandleForModule(
 		processHandle, 
-		"steamclient.dll");
+		"steamclient.dll"
+	);
+
 	auto moduleSize = GetModuleSize(
 		processHandle, 
-		moduleHandle);
+		moduleHandle
+	);
+
 	std::cout 
 		<< "steamclient.dll @ " 
 		<< std::hex
-		<< reinterpret_cast<uint32_t>(moduleHandle)
+		<< reinterpret_cast<uintptr_t>(moduleHandle)
 		<< " -> "
 		<< std::hex
-		<< reinterpret_cast<uint32_t>(moduleHandle) + moduleSize
+		<< reinterpret_cast<uintptr_t>(moduleHandle) + moduleSize
 		<< std::endl;
+
 	auto patchAddress = GetPatchAddress(
 		processHandle, 
-		reinterpret_cast<uint32_t>(moduleHandle),
-		moduleSize);
+		reinterpret_cast<uintptr_t>(moduleHandle),
+		moduleSize
+	);
+
 	std::cout
 		<< "instruction @ "
 		<< std::hex
 		<< patchAddress
 		<< std::endl;
+
 	if (WritePatch(
 		processHandle,
-		reinterpret_cast<uint32_t>(moduleHandle),
+		reinterpret_cast<uintptr_t>(moduleHandle),
 		moduleSize,
-		patchAddress))
+		patchAddress
+	))
 	{
-		std::cout << "successfully patched!" << std::endl;
+		std::cout << "Successfully patched!" << std::endl;
 	}
 	else
 	{
-		std::cout << "something failed!" << std::endl;
+		std::cout << "Something failed!" << std::endl;
 	}
+
 	std::getchar();
+
 	return 0;
 }
