@@ -1,3 +1,5 @@
+Migrated to [zig.SteamManifestPatcher](https://github.com/fifty-six/zig.SteamManifestPatcher/)
+
 # SteamManifestFixer
 Allows you to download depot files from Steam's console, even when the manifest file isn't available anymore.
 
